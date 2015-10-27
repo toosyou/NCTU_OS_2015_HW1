@@ -45,6 +45,9 @@ struct command{
         segment.clear();;
         mode = FOREGROUND_EXECUTION;
     }
+    int size(void){
+        return this->segment.size();
+    }
 };
 
 int cmd_cd(string path){
@@ -68,7 +71,7 @@ void shell_command_parser(string &input,command &command_line){
     command_segment tmp_seg;
     while(iss >> buffer){
         if( buffer[buffer.size()-1] == '|' ){
-            if(buffer.size() != 0){
+            if(buffer.size() != 1){
                 string buffer_without_l(buffer.c_str(),buffer.size()-1);
                 tmp_seg.args.push_back(buffer_without_l);
             }
@@ -104,90 +107,109 @@ int shell_exec_builtin(command_segment &segment){
     return 1;
 }
 
-int shell_exec_segment(command_segment &segment, int in_fd, int out_fd, int mode, int pgid){
+int shell_exec_segment(command_segment &segment, int in_fd, int out_fd, int mode, int pgid , vector<vector<int> > &fds){
+    /*cout << "size : " <<segment.args.size() << " ";
     for(int i=0;i<segment.args.size();++i){
         cout << segment.args[i] << " ";
-    }cout <<endl;
+    }cout <<endl;*/
 
     if(shell_exec_builtin(segment))
         return 0;
 
+    char** args = new char*[segment.args.size()+1];
+    for(int i=0;i<segment.args.size();++i){
+        args[i] = new char[segment.args[i].size()+1];
+        strcpy(args[i],segment.args[i].c_str());
+    }
+    args[ segment.args.size() ] = NULL;
+
     pid_t childpid = fork();
+    if(childpid == -1){
+        cout << "wrong at fork" <<endl;
+        exit(0);
+    }
 
     if(childpid == 0){//child
-        if(in_fd != 0 && dup2(in_fd,STDIN_FILENO) == -1){
-            exit(errno);
+        cout << "in_fd : " << in_fd << "\tout_fd : " << out_fd <<endl;
+        if(in_fd != STDIN_FILENO){
+            if(dup2(in_fd,STDIN_FILENO) == -1){
+                cerr << strerror(errno) <<endl;
+                exit(errno);
+            }
         }
 
-        if(out_fd != 1 && dup2(out_fd,STDOUT_FILENO) == -1){
-            exit(errno);
+        if(out_fd != STDOUT_FILENO){
+            if(dup2(out_fd,STDOUT_FILENO) == -1){
+                cerr << strerror(errno) <<endl;
+                exit(errno);
+            }
         }
 
-        char **args = new char*[segment.args.size()+1];
-        for(int i=0;i<segment.args.size();++i){
-            args[i] = new char[ segment.args.size()+2 ];
-            strcpy(args[i],segment.args[i].c_str());
+        //close all the fds
+        for(int i=0;i<fds.size();++i){
+            close(fds[i][0]);
+            close(fds[i][1]);
         }
-        args[ segment.args.size() ] = NULL;
 
         execvp(segment.args[0].c_str(),args);
+
         exit(errno);
     }
     else{//parent
+        int status = 0;
         cout << "Command executed by pid=" << childpid <<endl;
-        if(mode == FOREGROUND_EXECUTION){
-            int state = 0;
-            waitpid(childpid,&state,0);
-            if(WIFEXITED(state)){
-                cout << strerror(WEXITSTATUS(state)) <<endl;
-                return -1;
-            }
-            return 0;
+        if(in_fd != STDIN_FILENO)
+            close(in_fd);
+        if(out_fd != STDOUT_FILENO)
+            close(out_fd);
+        if(waitpid(childpid,&status,0) == -1){
+            cerr << WEXITSTATUS(status) <<endl;
+            return 1;
         }
+        for(int i=0;i<segment.args.size();++i)
+            delete [] args[i];
+        delete [] args;
+        return 0;
     }
 
     return 0;
 }
 
 int shell_exec_command(command &command_line){
-    list<int> fds;
-    fds.push_back(0);
-    for(int i=0;i<command_line.segment.size()-1;++i){
+    int rtn_exec = 0;
+    vector< vector<int> > fds;
+    list<command_segment>::iterator it = command_line.segment.begin();
+
+    for(int i=0;i<command_line.size()-1;++i){
+        vector<int> tmp_pipe(2,0);
         int tmp_fd[2];
-        pipe(tmp_fd);
-        fds.push_back(tmp_fd[0]);
-        fds.push_back(tmp_fd[1]);
+        if(pipe(tmp_fd) == -1){
+            cerr << "wrong ar pipe()" <<endl;
+            return -1;
+        }
+        tmp_pipe[0] = tmp_fd[0];
+        tmp_pipe[1] = tmp_fd[1];
+        fds.push_back(tmp_pipe);
     }
-    fds.push_back(1);
+    for(int i=0;i<command_line.size();++i){
+        int in_fd = 0;
+        int out_fd = 1;
+        if(i != 0)
+            in_fd = fds[i-1][1];
+        if(i != command_line.size()-1)
+            out_fd = fds[i][0];
 
-    while(!command_line.segment.empty()){
-
-        list<int>::iterator tmp_it = fds.begin();
-        int fd0 = *fds.begin();
-        tmp_it++;
-        int fd1 = *tmp_it;
-
-        if(shell_exec_segment(*command_line.segment.begin(),fd0,fd1,command_line.mode,0 ) != 0){
-            command_line.clear();
-            while(!fds.empty()){
-                if(fd0 > 1)
-                    close(fd0);
-                fds.pop_front();
-            }
-            return 0;
+        rtn_exec = shell_exec_segment(*it,in_fd,out_fd,command_line.mode,0,fds);
+        if(rtn_exec != 0){
+            cout << rtn_exec <<endl;
+            break;
         }
         else{
-            command_line.segment.pop_front();
+            it++;
         }
-        if(fd0 > 1)
-            close(fd0);
-        fds.pop_front();
     }
-    while(!fds.empty()){
-        if((*fds.begin()) > 1)
-            close((*fds.begin()));
-        fds.pop_front();
-    }
+    command_line.clear();
+    fds.clear();
     return 0;
 }
 
