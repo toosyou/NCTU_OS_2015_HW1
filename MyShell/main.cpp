@@ -2,11 +2,13 @@
 #include <vector>
 #include <string>
 #include <list>
-#include <cstdio>
-#include <cstdlib>
+#include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sstream>
+#include <string.h>
+#include <sys/wait.h>
 
 using namespace std;
 
@@ -158,14 +160,15 @@ int shell_exec_segment(command_segment &segment, int in_fd, int out_fd, int mode
     else{//parent
         int status = 0;
         cout << "Command executed by pid=" << childpid <<endl;
-        if(in_fd != STDIN_FILENO)
-            close(in_fd);
-        if(out_fd != STDOUT_FILENO)
-            close(out_fd);
         if(waitpid(childpid,&status,0) == -1){
             cerr << WEXITSTATUS(status) <<endl;
             return 1;
         }
+
+        if(in_fd != STDIN_FILENO)
+            close(in_fd);
+        if(out_fd != STDOUT_FILENO)
+            close(out_fd);
         for(int i=0;i<segment.args.size();++i)
             delete [] args[i];
         delete [] args;
@@ -195,9 +198,9 @@ int shell_exec_command(command &command_line){
         int in_fd = 0;
         int out_fd = 1;
         if(i != 0)
-            in_fd = fds[i-1][1];
+            in_fd = fds[i-1][0];
         if(i != command_line.size()-1)
-            out_fd = fds[i][0];
+            out_fd = fds[i][1];
 
         rtn_exec = shell_exec_segment(*it,in_fd,out_fd,command_line.mode,0,fds);
         if(rtn_exec != 0){
