@@ -9,6 +9,7 @@
 #include <sstream>
 #include <string.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 using namespace std;
 
@@ -19,6 +20,9 @@ using namespace std;
 #define BACKGROUND_EXECUTION 0
 #define FOREGROUND_EXECUTION 1
 #define PIPELINE_EXECUTION 2
+
+vector<pid_t> fore_pigds;
+vector<pid_t> back_pigds;
 
 struct command_segment{
     vector<string> args;
@@ -66,6 +70,11 @@ int cmd_exit(void){
     exit(0);
 }
 
+int cmd_kill(string pid_s){
+    kill(atoi(pid_s.c_str()),SIGINT);
+    return 0;
+}
+
 void shell_command_parser(string &input,command &command_line){
     istringstream iss(input);
     string buffer;
@@ -89,6 +98,13 @@ void shell_command_parser(string &input,command &command_line){
             tmp_seg.clear();
             command_line.mode = BACKGROUND_EXECUTION;
         }
+        else if(buffer[0] == '|'){
+            command_line.segment.push_back(tmp_seg);
+            tmp_seg.clear();
+
+            string buffer_without_l(buffer.begin()+1,buffer.end());
+            tmp_seg.args.push_back(buffer_without_l);
+        }
         else{
             tmp_seg.args.push_back(buffer);
         }
@@ -104,16 +120,14 @@ int shell_exec_builtin(command_segment &segment){
         cmd_cd(segment.args[1]);
     if(arg0 == "exit")
         cmd_exit();
+    if(arg0 == "kill")
+        cmd_kill(segment.args[1]);
     else
         return 0; // it's not a builtin-function
     return 1;
 }
 
 int shell_exec_segment(command_segment &segment, int in_fd, int out_fd, int mode, int pgid , vector<vector<int> > &fds){
-    /*cout << "size : " <<segment.args.size() << " ";
-    for(int i=0;i<segment.args.size();++i){
-        cout << segment.args[i] << " ";
-    }cout <<endl;*/
 
     if(shell_exec_builtin(segment))
         return 0;
@@ -132,15 +146,16 @@ int shell_exec_segment(command_segment &segment, int in_fd, int out_fd, int mode
     }
 
     if(childpid == 0){//child
-        cout << "in_fd : " << in_fd << "\tout_fd : " << out_fd <<endl;
-        if(in_fd != STDIN_FILENO){
+        //cout << "in_fd : " << in_fd << "\tout_fd : " << out_fd <<endl;
+
+        if(in_fd != STDIN_FILENO && in_fd != -1){
             if(dup2(in_fd,STDIN_FILENO) == -1){
                 cerr << strerror(errno) <<endl;
                 exit(errno);
             }
         }
 
-        if(out_fd != STDOUT_FILENO){
+        if(out_fd != STDOUT_FILENO && out_fd != -1){
             if(dup2(out_fd,STDOUT_FILENO) == -1){
                 cerr << strerror(errno) <<endl;
                 exit(errno);
@@ -153,22 +168,33 @@ int shell_exec_segment(command_segment &segment, int in_fd, int out_fd, int mode
             close(fds[i][1]);
         }
 
-        execvp(segment.args[0].c_str(),args);
+        if(execvp(segment.args[0].c_str(),args) == -1){
+            cerr << strerror(errno) <<endl;
+        }
 
         exit(errno);
     }
     else{//parent
-        int status = 0;
-        cout << "Command executed by pid=" << childpid <<endl;
-        if(waitpid(childpid,&status,0) == -1){
-            cerr << WEXITSTATUS(status) <<endl;
-            return 1;
+        if(pgid == 0){//it's first segment
+            if(setpgid(childpid,childpid) == -1){
+                cout << "setpgid error" <<endl;
+                cout << strerror(errno) <<endl;
+            }
+            segment.pgid = childpid;
+            cout << "pgid = " << childpid <<endl;
         }
+        else{
+            if(setpgid(childpid,pgid) == -1){
+                cout << "setpgid error" <<endl;
+                cout << strerror(errno) <<endl;
+            }
+            segment.pgid = pgid;
+            cout << "pgid = " << pgid <<endl;
+        }
+        segment.pid = childpid;
 
-        if(in_fd != STDIN_FILENO)
-            close(in_fd);
-        if(out_fd != STDOUT_FILENO)
-            close(out_fd);
+        cout << "Command executed by pid = " << childpid <<endl;
+
         for(int i=0;i<segment.args.size();++i)
             delete [] args[i];
         delete [] args;
@@ -179,6 +205,7 @@ int shell_exec_segment(command_segment &segment, int in_fd, int out_fd, int mode
 }
 
 int shell_exec_command(command &command_line){
+    int wait_status = 0;
     int rtn_exec = 0;
     vector< vector<int> > fds;
     list<command_segment>::iterator it = command_line.segment.begin();
@@ -187,7 +214,7 @@ int shell_exec_command(command &command_line){
         vector<int> tmp_pipe(2,0);
         int tmp_fd[2];
         if(pipe(tmp_fd) == -1){
-            cerr << "wrong ar pipe()" <<endl;
+            cerr << "wrong at pipe()" <<endl;
             return -1;
         }
         tmp_pipe[0] = tmp_fd[0];
@@ -195,22 +222,58 @@ int shell_exec_command(command &command_line){
         fds.push_back(tmp_pipe);
     }
     for(int i=0;i<command_line.size();++i){
-        int in_fd = 0;
-        int out_fd = 1;
+        int in_fd = STDIN_FILENO;
+        int out_fd = STDOUT_FILENO;
         if(i != 0)
             in_fd = fds[i-1][0];
         if(i != command_line.size()-1)
             out_fd = fds[i][1];
 
-        rtn_exec = shell_exec_segment(*it,in_fd,out_fd,command_line.mode,0,fds);
+        rtn_exec = shell_exec_segment(*it,in_fd,out_fd,command_line.mode,command_line.segment.front().pgid,fds);
         if(rtn_exec != 0){
-            cout << rtn_exec <<endl;
+            cerr << "rtn_exec = " << rtn_exec <<endl;
             break;
         }
         else{
             it++;
         }
     }
+    //close all pipe in parent
+    for(int i=0;i<fds.size();++i){
+        close(fds[i][0]);
+        close(fds[i][1]);
+    }
+
+    //wait for this group if mode is foreground
+    if(command_line.mode == FOREGROUND_EXECUTION){
+        pid_t child_pgid = command_line.segment.front().pgid;
+        pid_t this_pid = getpid();
+        fore_pigds.push_back(child_pgid);
+        cout << "pgid of child = " << child_pgid<<endl;
+        cout << "waitpid( " << -child_pgid << " )" <<endl;
+        //make it foreground
+        if(tcsetpgrp(STDIN_FILENO,child_pgid) == -1){
+            cerr << "tcsetpgrp error" <<endl;
+            cerr << strerror(errno) <<endl;
+        }
+        //wait for pgid
+        for(int i=0;i<command_line.size();++i){
+            if(waitpid(-child_pgid,&wait_status,WUNTRACED) == -1){
+                cerr << "waitpid wrong" <<endl;
+                cerr << strerror(errno) <<endl;
+            }
+        }
+        if(tcsetpgrp(STDIN_FILENO,this_pid) == -1){
+            cerr << "tcsetpgrp error" <<endl;
+            cerr << strerror(errno) <<endl;
+        }
+        fore_pigds.pop_back();
+    }
+    else if(command_line.mode == BACKGROUND_EXECUTION){
+        back_pigds.push_back(command_line.segment.front().pgid);
+    }
+
+
     command_line.clear();
     fds.clear();
     return 0;
@@ -248,7 +311,20 @@ void shell_welcome(){
     return;
 }
 
+void kill_foreground(int signum){
+    for(int i=0;i<fore_pigds.size();++i){
+        kill(-fore_pigds[i],SIGINT);
+    }
+    fore_pigds.clear();
+    return;
+}
+
 void shell_init(){
+    //set this pgid
+    setpgid(0,0);
+    //set ctrl+C
+    signal(SIGINT,&kill_foreground);
+
     return;
 }
 
