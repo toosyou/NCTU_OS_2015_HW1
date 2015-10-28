@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <map>
 
 using namespace std;
 
@@ -21,8 +22,16 @@ using namespace std;
 #define FOREGROUND_EXECUTION 1
 #define PIPELINE_EXECUTION 2
 
-vector<pid_t> fore_pigds;
-vector<pid_t> back_pigds;
+struct pgid_with_size{
+    pid_t pgid;
+    int size;
+    pgid_with_size(){
+        pgid = 0;
+        size = 0;
+    }
+};
+
+vector<pgid_with_size> back_pgids;
 
 struct command_segment{
     vector<string> args;
@@ -66,12 +75,55 @@ int cmd_cd(string path){
 }
 
 int cmd_exit(void){
+    //clean up
+    for(int i=0;i<back_pgids.size();++i){
+        kill(-back_pgids[i].pgid,SIGINT);
+    }
+    //say goodbye!
     cout << "Goodbye!" <<endl;
     exit(0);
 }
 
 int cmd_kill(string pid_s){
     kill(atoi(pid_s.c_str()),SIGINT);
+    return 0;
+}
+
+int cmd_fg(string pgid_s){
+    int this_pid = getpid();
+    int pgid = atoi(pgid_s.c_str());
+    int index_pgid = -1;
+    int wait_status;
+
+    //find it in background_pigds
+    for(int i=0;i<back_pgids.size();++i){
+        if(back_pgids[i].pgid == pgid)
+            index_pgid = i;
+    }
+    if(index_pgid == -1){
+        cout << "pid/pgid not found" << endl;
+        return -1;
+    }
+
+    //make it foreground
+    if(tcsetpgrp(STDIN_FILENO,pgid) == -1){
+        cerr << "tcsetpgrp error" <<endl;
+        cerr << strerror(errno) <<endl;
+    }
+    //wait for pgid
+    for(int i=0;i<back_pgids[index_pgid].size;++i){
+        if(waitpid(-pgid,&wait_status,WUNTRACED) == -1 && errno != ECHILD){
+            cerr << "waitpid wrong" <<endl;
+            cerr << strerror(errno) <<endl;
+        }
+    }
+    if(tcsetpgrp(STDIN_FILENO,this_pid) == -1){
+        cerr << "tcsetpgrp error" <<endl;
+        cerr << strerror(errno) <<endl;
+    }
+
+    back_pgids.erase(back_pgids.begin()+index_pgid);
+
     return 0;
 }
 
@@ -122,6 +174,8 @@ int shell_exec_builtin(command_segment &segment){
         cmd_exit();
     if(arg0 == "kill")
         cmd_kill(segment.args[1]);
+    if(arg0 == "fg")
+        cmd_fg(segment.args[1]);
     else
         return 0; // it's not a builtin-function
     return 1;
@@ -181,7 +235,7 @@ int shell_exec_segment(command_segment &segment, int in_fd, int out_fd, int mode
                 cout << strerror(errno) <<endl;
             }
             segment.pgid = childpid;
-            cout << "pgid = " << childpid <<endl;
+            //cout << "pgid = " << childpid <<endl;
         }
         else{
             if(setpgid(childpid,pgid) == -1){
@@ -189,7 +243,7 @@ int shell_exec_segment(command_segment &segment, int in_fd, int out_fd, int mode
                 cout << strerror(errno) <<endl;
             }
             segment.pgid = pgid;
-            cout << "pgid = " << pgid <<endl;
+            //cout << "pgid = " << pgid <<endl;
         }
         segment.pid = childpid;
 
@@ -248,9 +302,7 @@ int shell_exec_command(command &command_line){
     if(command_line.mode == FOREGROUND_EXECUTION){
         pid_t child_pgid = command_line.segment.front().pgid;
         pid_t this_pid = getpid();
-        fore_pigds.push_back(child_pgid);
-        cout << "pgid of child = " << child_pgid<<endl;
-        cout << "waitpid( " << -child_pgid << " )" <<endl;
+
         //make it foreground
         if(tcsetpgrp(STDIN_FILENO,child_pgid) == -1){
             cerr << "tcsetpgrp error" <<endl;
@@ -258,7 +310,7 @@ int shell_exec_command(command &command_line){
         }
         //wait for pgid
         for(int i=0;i<command_line.size();++i){
-            if(waitpid(-child_pgid,&wait_status,WUNTRACED) == -1){
+            if(waitpid(-child_pgid,&wait_status,WUNTRACED) == -1 && errno != ECHILD){
                 cerr << "waitpid wrong" <<endl;
                 cerr << strerror(errno) <<endl;
             }
@@ -267,12 +319,13 @@ int shell_exec_command(command &command_line){
             cerr << "tcsetpgrp error" <<endl;
             cerr << strerror(errno) <<endl;
         }
-        fore_pigds.pop_back();
     }
     else if(command_line.mode == BACKGROUND_EXECUTION){
-        back_pigds.push_back(command_line.segment.front().pgid);
+        pgid_with_size tmp_pgid_w_size;
+        tmp_pgid_w_size.pgid = command_line.segment.front().pgid;
+        tmp_pgid_w_size.size = command_line.segment.size();
+        back_pgids.push_back(tmp_pgid_w_size);
     }
-
 
     command_line.clear();
     fds.clear();
@@ -312,10 +365,31 @@ void shell_welcome(){
 }
 
 void kill_foreground(int signum){
-    for(int i=0;i<fore_pigds.size();++i){
-        kill(-fore_pigds[i],SIGINT);
+    fflush(stdin);
+    shell_print_promt();
+    return;
+}
+void do_nothing(int signum){
+    return;
+}
+void make_shell_forground(int signum){
+    int this_pgid = getpgid(0);
+    //set parent to foreground
+    if(tcsetpgrp(STDIN_FILENO,this_pgid) == -1){
+        cerr << "tcsetpgrp error" <<endl;
+        cerr << strerror(errno) <<endl;
     }
-    fore_pigds.clear();
+    return;
+}
+
+void deal_with_zombie(int signum){
+    int status = 0;
+    int zombie_pid = waitpid(-1,&status,0);
+    if(zombie_pid == -1){
+        cout << "error occures when dealing with zombie" <<endl;
+        cout << strerror(errno) <<endl;
+        exit(0);
+    }
     return;
 }
 
@@ -324,6 +398,13 @@ void shell_init(){
     setpgid(0,0);
     //set ctrl+C
     signal(SIGINT,&kill_foreground);
+    //set ctrl+Z
+    signal(SIGTSTP,&make_shell_forground);
+    //set SIGCHLD for zombie
+    signal(SIGCHLD,&deal_with_zombie);
+
+    signal(SIGTTIN,SIG_IGN);
+    signal(SIGTTOU,SIG_IGN);
 
     return;
 }
