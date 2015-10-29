@@ -179,6 +179,7 @@ void shell_command_parser(string &input,command &command_line){
 
     command_segment tmp_seg;
     while(iss >> buffer){
+        int l_location = buffer.find("|");
         if( buffer[buffer.size()-1] == '|' ){
             if(buffer.size() != 1){
                 string buffer_without_l(buffer.c_str(),buffer.size()-1);
@@ -202,6 +203,14 @@ void shell_command_parser(string &input,command &command_line){
 
             string buffer_without_l(buffer.begin()+1,buffer.end());
             tmp_seg.args.push_back(buffer_without_l);
+        }
+        else if(l_location != string::npos){
+            string front(buffer.begin(),buffer.begin()+l_location);
+            string back(buffer.begin()+l_location+1,buffer.end());
+            tmp_seg.args.push_back(front);
+            command_line.segment.push_back(tmp_seg);
+            tmp_seg.args.clear();
+            tmp_seg.args.push_back(back);
         }
         else{
             tmp_seg.args.push_back(buffer);
